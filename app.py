@@ -3,14 +3,78 @@ import pandas as pd
 import pandas_gbq
 import numpy as np
 from lightfm import LightFM
-from lightfm.data import Dataset
-from random_split import random_train_test_split
-from lightfm.evaluation import precision_at_k, auc_score
+from pymongo import MongoClient
+from pymongo import UpdateOne
+from utils.files_manager import *
+from utils.Recommender import RecomManager
+from utils.DataManager import DataManager
+from utils.Evaluate import evaluate_fm
 NUM_THREADS = 16
 
 
 def read_bq(q):
     return pandas_gbq.read_gbq(q, use_bqstorage_api=True)
+
+def split_df(df_, n_cores=multiprocessing.cpu_count()):
+    """Spliting DataFrame into chunks"""
+
+    batch_size = 1 if round(df_.shape[0]/n_cores) < 1 else round(df_.shape[0]/n_cores)
+    rest = df_.shape[0]%batch_size 
+    cumulative = 0
+    for i in range(n_cores):
+        cumulative += batch_size
+        if i == n_cores-1:
+            yield df_.iloc[batch_size*i:cumulative+rest]
+        else:
+           yield df_.iloc[batch_size*i:cumulative]
+
+
+def write_mongo(df_,param):
+    """Update DataFrame to mongoDB"""
+
+    print('Starting process')
+    if param['PASSWORD'] == '':
+        client = MongoClient(host=param['HOST'],port=param['PORT'])
+                                    
+    else:  
+        try:
+            client = MongoClient(host=param['HOST'],port=param['PORT'],
+                                        username=param['USER_NAME'],password=param['PASSWORD'],
+                                        authSource=param['AUTHSOURCE'],
+                                        authMechanism=param['AUTHMECHANISM'],replicaset=param['REPLICA_SET'])
+        except Exception as e:
+            print("Connection Faild!:",e)
+
+    db = client[param['DB_NAME']]
+    collection = db[param['COLLECTION_NAME']]
+    
+    bulk_operation = []
+    for i in range(df_.shape[0]):
+        
+        reco_list = [x for x in df_.iloc[i,1:].to_list() if x==x]
+        bulk_operation.append(UpdateOne({"_id": int(df_.iloc[i,0])}, {'$set': {'recomendation': reco_list}},upsert=True))
+    
+    try:
+        collection.bulk_write(bulk_operation, ordered=False)  
+
+    except Exception as e:
+        print("Write_bulk Failed!", e)          
+            
+    print('Completed process',df_.shape)
+    client.close()
+
+
+def write_mongo_parallel(_df,param):
+    processes = [ multiprocessing.Process(target=write_mongo, 
+                                      args=(d,param )) for d in split_df(_df)]
+
+    for process in processes:
+        process.start()
+    
+    for process in processes:
+        process.join()
+        
+
 
 
 def train_fm(train_, epochs=30, items_features=None, users_features=None, loss='warp', n_comp=64):
@@ -22,122 +86,47 @@ def train_fm(train_, epochs=30, items_features=None, users_features=None, loss='
                verbose=True)
     return model_
 
+def main(config_file):
+    uid = read_bq(open_file(config_file['USERS_ARTICLES']['query_path']))
 
-def evaluate_fm(model_, te_, tr_,
-                items_features=None,
-                users_features=None):
-    if not tr_.multiply(te_).nnz == 0:
-        print('train test interaction are not fully disjoin')
-
-    # Compute and print the AUC score
-    train_auc = auc_score(model_, tr_,
-                          item_features=items_features,
-                          user_features=users_features,
-                          num_threads=NUM_THREADS).mean()
-    print('Collaborative filtering train AUC: %s' % train_auc)
-
-    test_auc = auc_score(model_, te_,
-                         train_interactions=tr_,
-                         item_features=items_features,
-                         user_features=users_features,
-                         num_threads=NUM_THREADS).mean()
-    print('Collaborative filtering test AUC: %s' % test_auc)
-    p_at_k_train = precision_at_k(model_, tr_,
-                                  item_features=items_features,
-                                  user_features=users_features,
-                                  k=5, num_threads=NUM_THREADS).mean()
-    p_at_k_test = precision_at_k(model_, te_, train_interactions=tr_,
-                                 item_features=items_features,
-                                 user_features=users_features,
-                                 k=5, num_threads=NUM_THREADS).mean()
-
-    print("Train precision: %.2f" % p_at_k_train)
-    print("Test precision: %.2f" % p_at_k_test)
+    white_list_articles = read_bq(open_file(config_file['WHITE_LIST_ARTICLES']['query_path']))
+    #white_list_articles = set(white_list_articles.article_id.tolist())
+    
+    dm = DataManager(uid,users_col='uid',items_col='article_id')
+    dm.fit_df_train(white_list_articles)
+    model = train_fm(dm.train)
+    rm = RecomManager(model,dm)
+    recom = rm.predict()
+    evaluate_fm(model, dm.test, dm.train)
+    write_mongo_parallel(recom,config_file['MONGO_DB'])
 
 
-def chunks(l, n):
-    """Yield n number of striped chunks from l."""
-    for i in range(0, n):
-        yield l[i::n]
+def scheduler(config_file):
+    print("{} | app started".format(datetime.now()))
+    main(config_file)
+    schedule.every().day.at(config_file['SCHEDULE']['time']).do(main,config_file)
+    
+    while True:
+        schedule.run_pending()
+        sleep(60)
+    
 
 
-def worker_func(model, users, item_ids, uid_map, articles_map_, user_dict, k=20):
-    # Do work. This function will have read-only access to
-    # the data array.
-
-    # for u in users:
-    #     scores = model.predict(np.full(len(item_ids),u),item_ids)
-    #     user_dict[u] = [articles_map_[i] for i in  np.argsort(-scores)[:k]]
-    for u in users:
-        scores = model.predict(u, item_ids)
-        user_dict[uid_map[u]] = [articles_map_[item_ids[i]]
-                                 for i in np.argsort(-scores)[:k]]
+if __name__ == 'main':
+    config_file_path = generate_path('CONFIG_FILE.json')
+    config_file = read_config(config_file_path )
+    #scheduler(config_file)
+    main(config_file)
 
 
-uid_q = " select uid,article_id from `htz-common.Recommendations.fm_train_by_uid`"
-uid = read_bq(uid_q)
-
-dataset = Dataset()
 
 
-dataset.fit(users=uid.uid.unique(),
-            items=uid.article_id.unique())
 
-(interactions, weights) = dataset.build_interactions(
-    (x.uid, x.article_id) for x in uid.itertuples())
-n_users, n_items = interactions.shape
 
-user_id_map, user_feature_map, item_id_map, item_feature_map = dataset.mapping()
-articles_map = {v: k for k, v in item_id_map.items()}
-uids_map = {v: k for k, v in user_id_map.items()}
-white_list_articles = read_bq(
-    """select article_id,publish_time from  `htz-common.Recommendations.white_list`""")
-white_list_articles = set(white_list_articles.article_id.tolist())
 
-white_articles_map = {k: v for k,
-                      v in articles_map.items() if v in white_list_articles}
 
-tr, te = random_train_test_split(interactions, test_percentage=0.2)
 
-#model_with_features = train_fm(tr,users_features=user_features,items_features=item_features,loss='warp')
-model = train_fm(tr, loss='warp')
-evaluate_fm(model, te, tr)
 
-items_ids = list(white_articles_map.keys())
 
-workers = 16
-manager = multiprocessing.Manager()
-sdict = manager.dict()
-processes = [multiprocessing.Process(target=worker_func,
-                                     args=(model, d, items_ids, uids_map, white_articles_map, sdict))
-             for d in chunks(range(n_users), workers)]
 
-for process in processes:
-    process.start()
 
-for process in processes:
-    process.join()
-
-recom = dict(sdict)
-recom.keys()
-
-recom1 = {uids_map[k]: [i for i in v if i in white_list_articles]
-          for k, v in recom.items()}
-
-recom[49509]
-uid[uid.uid == 1001].article_id
-
-[i for i in recom[49509] if i in uid[uid.uid == 49509].article_id]
-
-[d for d in chunks(uid.uid.unique(), workers)]
-'1.9196961' in white_list_articles
-
-df = pd.DataFrame(recom.items(), columns=['uid', 'recom'])
-df = df.explode('recom').reset_index(drop=True)
-df = df.merge(white_list_articles.set_index(
-    'article_id'), left_on='recom', right_index=True)
-df = df.sort_values(by=['uid', 'publish_time'], ascending=False)
-
-df[df.uid == 1001]
-g = df.groupby(['uid'])['recom'].unique()
-g

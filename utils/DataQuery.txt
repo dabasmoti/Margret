@@ -1,0 +1,29 @@
+ declare end_period DATE DEFAULT DATE_SUB(current_date(), interval 1 day);
+declare start_period DATE DEFAULT DATE_SUB(current_date(), interval 5 day);
+with reqs as  (
+                  SELECT
+                  uid,
+                  article_id,
+                  FROM
+                    `htz-common.clean_data.requests` 
+                  WHERE
+                    DATE(event_time) between start_period and end_period
+                    and article_id is not null
+                    and platform not in ('Robot Mobile','Anonymized','Spy')
+                    and platform is not null
+                    and brand = 'HTZ'
+                    and record_type != 'impression'
+                    and uid is not null
+                    and uid  in (
+                                 select 
+                                       uid
+                                 from 
+                                 `htz-common.clean_data.users`, unnest ( subscription)
+                                )
+                )
+
+
+
+SELECT  uid,article_id FROM  reqs
+      
+GROUP BY 1,2
